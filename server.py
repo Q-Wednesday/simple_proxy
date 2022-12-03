@@ -1,22 +1,62 @@
 import socket
 import sys
 import _thread
+import ssl
+from ssl_connect import connectSSL
 
 from Crypto.Cipher import AES
 
 BACKLOG = 50
 MAX_DATA_RECV = 999999
 DEBUG = True  # set to True to see the debug msgs
-BLOCKED = []  # just an example. Remove with [""] for no blocking at all.
 
-key = b'this is a 16 key'
-def decrypt(ciptext:bytes)->bytes:
-    mydecrypt = AES.new(key, AES.MODE_CFB, ciptext[:16])
-    return mydecrypt.decrypt(ciptext)
-def proxy_thread(conn, client_addr):
+users = ["test.user"]
+user_password = {
+    "test.user": "123456"
+}
+verified_user = {}
+
+
+def get_common_name(subject) -> str:
+    for field in subject:
+        if field[0][0] == 'commonName':
+            return str(field[0][1])
+    return ''
+
+
+def control_panel(conn: ssl.SSLSocket):
+    conn.send(b"USER NAME:")
+    user_name = conn.recv().decode()
+    subject = conn.getpeercert()['subject']
+    print("subject:", subject)
+    if get_common_name(subject) != user_name:
+        conn.send(b"USER NAME AND CERTIFICATE NOT MATCH, CLOSE")
+        print(user_name, get_common_name(subject))
+        conn.close()
+        return
+    conn.send(b"PASSWORD:")
+    pass_word = conn.recv().decode()
+    if pass_word != user_password[user_name]:
+        conn.send(b"USER NAME AND PASSWORD NOT MATCH, CLOSE")
+        conn.close()
+        return
+    verified_user[user_name] = True
+    conn.send(b"VERIFIED")
+    while True:
+        message = conn.recv()
+        if message.decode() == 'CLOSE':
+            verified_user.pop(user_name)
+            conn.send(b"CLOSE")
+            conn.close()
+            return
+        else:
+            conn.send(b"UNKNOWN COMMAND")
+            continue
+
+
+def proxy_handler(conn: ssl.SSLSocket, client_addr):
     # get the request from browser
     request = conn.recv(MAX_DATA_RECV)
-    request = decrypt(request)
     print(str(request))
 
     # parse the first line
@@ -25,15 +65,7 @@ def proxy_thread(conn, client_addr):
     # get url
     url = first_line.split(b' ')[1]
 
-    for i in range(0, len(BLOCKED)):
-        if BLOCKED[i] in url:
-            print("Blacklisted", first_line, client_addr)
-            conn.close()
-            sys.exit(1)
-
     print("Request", first_line, client_addr)
-    # print "URL:",url
-    # print
 
     # find the webserver and port
     http_pos = url.find(b'://')  # find pos of ://
@@ -84,14 +116,37 @@ def proxy_thread(conn, client_addr):
         sys.exit(1)
 
 
+def proxy_thread():
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sk = ssl.wrap_socket(recv_sock, keyfile="private.key", certfile="cert.crt",
+                         cert_reqs=ssl.CERT_REQUIRED, ca_certs="cert.crt")
+    sk.bind(('0.0.0.0', 9999))
+    sk.listen(BACKLOG)
+    while True:
+        conn, client_addr = sk.accept()
+        subject = conn.getpeercert()['subject']
+
+        if get_common_name(subject) not in verified_user:
+            conn.close()
+            print("reject connection from {}".format(client_addr))
+            continue
+
+        print("accept connection from {}".format(client_addr))
+        _thread.start_new_thread(proxy_handler, (conn, client_addr))
+
+
 def main():
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    recv_sock.bind(('127.0.0.1', 9999))
-    recv_sock.listen(BACKLOG)
+    sk = ssl.wrap_socket(recv_sock, keyfile="private.key", certfile="cert.crt",
+                         cert_reqs=ssl.CERT_REQUIRED, ca_certs="cert.crt")
+    sk.bind(('0.0.0.0', 8080))
+    sk.listen(BACKLOG)
+    _thread.start_new_thread(proxy_thread, ())
     while True:
-        conn, client_addr = recv_sock.accept()
+        conn, client_addr = sk.accept()
         print("accept connection from {}".format(client_addr))
-        _thread.start_new_thread(proxy_thread, (conn, client_addr))
+        _thread.start_new_thread(control_panel, (conn,))
+
 
 if __name__ == '__main__':
     main()
